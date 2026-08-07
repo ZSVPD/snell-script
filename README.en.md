@@ -47,6 +47,229 @@ bash <(curl -L -s snell-centos.jinqians.com)
 wget https://raw.githubusercontent.com/jinqians/snell.sh/refs/heads/main/snell-centos.sh -O snell-centos.sh && chmod +x snell-centos.sh && ./snell-centos.sh
 ```
 
+## Docker
+
+Docker Hub image tags:
+- `jinqians/snell-server:latest`: pinned to Snell v5.0.1, not v6
+- `jinqians/snell-server:v4`: current v4 tag, points to v4.1.1
+- `jinqians/snell-server:v5`: current v5 tag, points to v5.0.1
+- `jinqians/snell-server:v6`: current v6 beta tag, points to v6.0.0b4
+- Fixed v4 tags: `v4.0.0`, `v4.0.1`, `v4.1.0`, `v4.1.1`
+- Fixed v5 tags: `v5.0.0`, `v5.0.1`
+- Fixed v6 beta tags: `v6.0.0b1`, `v6.0.0b2`, `v6.0.0b3`, `v6.0.0b4`
+
+Supported platforms:
+- v4/v5: `linux/amd64`, `linux/arm64`, `linux/arm/v7`
+- v6: `linux/amd64`, `linux/arm64`
+
+After installing Docker, run v5 directly:
+
+```bash
+docker run -d --name snell-server \
+  --restart unless-stopped \
+  -p 6160:6160/tcp \
+  -p 6160:6160/udp \
+  -e SNELL_PORT=6160 \
+  -e SNELL_PSK=your_16_plus_char_psk \
+  -e SNELL_VER=v5 \
+  jinqians/snell-server:v5
+```
+
+If `SNELL_PSK` is omitted, the container generates one on first start:
+
+```bash
+docker run -d --name snell-server \
+  --restart unless-stopped \
+  -p 6160:6160/tcp \
+  -p 6160:6160/udp \
+  -e SNELL_PORT=6160 \
+  -e SNELL_VER=v5 \
+  -v ./snell-config:/etc/snell \
+  jinqians/snell-server:v5
+```
+
+View the generated PSK and config:
+
+```bash
+docker logs snell-server
+cat ./snell-config/snell-server.conf
+```
+
+To switch versions, change both the image tag and `SNELL_VER`:
+
+```bash
+# v4
+docker run -d --name snell-server \
+  --restart unless-stopped \
+  -p 6160:6160/tcp \
+  -p 6160:6160/udp \
+  -e SNELL_PORT=6160 \
+  -e SNELL_VER=v4 \
+  -v ./snell-config:/etc/snell \
+  jinqians/snell-server:v4
+
+# v6
+docker run -d --name snell-server \
+  --restart unless-stopped \
+  -p 6160:6160/tcp \
+  -p 6160:6160/udp \
+  -e SNELL_PORT=6160 \
+  -e SNELL_VER=v6 \
+  -v ./snell-config:/etc/snell \
+  jinqians/snell-server:v6
+```
+
+If you set `SNELL_PSK` manually, use at least 16 characters for v6 compatibility. v5 and v6 require both TCP and UDP port mappings. v4 only needs TCP, but keeping the UDP mapping is harmless.
+
+Run Snell with ShadowTLS:
+
+```bash
+docker run -d --name snell-shadowtls \
+  --restart unless-stopped \
+  -p 8443:8443/tcp \
+  -e SNELL_PORT=6160 \
+  -e SNELL_VER=v5 \
+  -e SNELL_LISTEN_HOST=127.0.0.1 \
+  -e SNELL_PSK=your_16_plus_char_psk \
+  -e SHADOWTLS_ENABLE=1 \
+  -e SHADOWTLS_PORT=8443 \
+  -e SHADOWTLS_PASSWORD=your_shadowtls_password \
+  -e SHADOWTLS_SNI=www.microsoft.com \
+  -v ./snell-config:/etc/snell \
+  jinqians/snell-server:v5
+```
+
+If `SHADOWTLS_PASSWORD` is omitted, the container generates one on first start and saves it to `./snell-config/shadowtls-password`. When ShadowTLS is enabled, clients connect to port `8443`; the Snell backend port `6160` is used inside the container and normally does not need to be published.
+
+View the generated ShadowTLS password:
+
+```bash
+cat ./snell-config/shadowtls-password
+```
+
+Client settings:
+
+| Item | Value |
+|------|-------|
+| Server | VPS public IP or domain |
+| Port | ShadowTLS public port, `8443` in the example |
+| Snell version | `5` |
+| Snell PSK | The `psk` value in `./snell-config/snell-server.conf` |
+| ShadowTLS password | The content of `./snell-config/shadowtls-password`, or the manually supplied `SHADOWTLS_PASSWORD` |
+| ShadowTLS SNI | `SHADOWTLS_SNI`, default `www.microsoft.com` |
+
+View the client secrets:
+
+```bash
+grep '^psk' ./snell-config/snell-server.conf
+cat ./snell-config/shadowtls-password
+```
+
+Surge example:
+
+```text
+HK = snell, SERVER_IP, 8443, psk = your_16_plus_char_psk, version = 5, reuse = true, tfo = true, shadow-tls-password = your_shadowtls_password, shadow-tls-sni = www.microsoft.com, shadow-tls-version = 3
+```
+
+Upgrade the image:
+
+```bash
+docker pull jinqians/snell-server:v5
+docker rm -f snell-server
+docker run -d --name snell-server \
+  --restart unless-stopped \
+  -p 6160:6160/tcp \
+  -p 6160:6160/udp \
+  -e SNELL_PORT=6160 \
+  -e SNELL_VER=v5 \
+  -v ./snell-config:/etc/snell \
+  jinqians/snell-server:v5
+```
+
+Remove the container:
+
+```bash
+docker rm -f snell-server
+```
+
+Run with Docker Compose:
+
+```yaml
+services:
+  snell:
+    image: jinqians/snell-server:latest
+    container_name: snell-server
+    restart: unless-stopped
+    ports:
+      - "6160:6160/tcp"
+      - "6160:6160/udp"
+    environment:
+      - SNELL_PORT=6160
+      - SNELL_VER=v5
+    volumes:
+      - ./snell-config:/etc/snell
+```
+
+Start it:
+
+```bash
+docker compose up -d
+```
+
+View the generated PSK and service logs:
+
+```bash
+docker logs snell-server
+cat ./snell-config/snell-server.conf
+```
+
+To set a PSK manually, add this to `environment`:
+
+```yaml
+      - SNELL_PSK=your_16_plus_char_psk
+```
+
+Run Snell with ShadowTLS using Docker Compose:
+
+```yaml
+services:
+  snell-shadowtls:
+    image: jinqians/snell-server:v5
+    container_name: snell-shadowtls
+    restart: unless-stopped
+    ports:
+      - "8443:8443/tcp"
+    environment:
+      - SNELL_PORT=6160
+      - SNELL_VER=v5
+      - SNELL_LISTEN_HOST=127.0.0.1
+      - SNELL_PSK=your_16_plus_char_psk
+      - SHADOWTLS_ENABLE=1
+      - SHADOWTLS_PORT=8443
+      - SHADOWTLS_PASSWORD=your_shadowtls_password
+      - SHADOWTLS_SNI=www.microsoft.com
+    volumes:
+      - ./snell-config:/etc/snell
+```
+
+Stop and remove the container:
+
+```bash
+docker compose down
+```
+
+Build v4/v5/v6 images locally:
+
+```bash
+./build-docker-images.sh
+```
+
+Build and push multi-architecture images:
+
+```bash
+USE_BUILDX=1 PUSH=1 ./build-docker-images.sh
+```
+
 ## 🆕 New Version Features (v4.0)
 ### Snell Version Support
 - ✅ **Snell v4** - Stable version, recommended for production environments
