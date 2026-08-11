@@ -1,9 +1,9 @@
 #!/bin/bash
 # =========================================
 # Автор: jinqians
-# Дата: ноябрь 2024
+# Дата: Ноябрь 2024
 # Сайт: jinqians.com
-# Описание: Этот скрипт предназначен для настройки BBR
+# Описание: Данный скрипт предназначен для настройки BBR
 # =========================================
 
 # Определение цветов
@@ -13,9 +13,9 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 RESET='\033[0m'
 
-# Проверка запуска от root
+# Проверка на запуск с правами root
 if [ "$(id -u)" != "0" ]; then
-    echo -e "${RED}Пожалуйста, запустите этот скрипт от имени root.${RESET}"
+    echo -e "${RED}Пожалуйста, запустите этот скрипт с правами root.${RESET}"
     exit 1
 fi
 
@@ -23,7 +23,8 @@ fi
 configure_system_and_bbr() {
     echo -e "${YELLOW}Настройка системных параметров и BBR...${RESET}"
     
-    cat > /etc/sysctl.conf << EOF
+    # ИСПРАВЛЕНИЕ: Записываем в отдельный файл вместо перезаписи основного sysctl.conf
+    cat > /etc/sysctl.d/99-bbr.conf << EOF
 fs.file-max = 6815744
 net.ipv4.tcp_no_metrics_save = 1
 net.ipv4.tcp_ecn = 0
@@ -51,12 +52,16 @@ net.ipv6.conf.all.forwarding = 1
 net.ipv6.conf.default.forwarding = 1
 EOF
 
-    sysctl -p
+    # Применяем настройки
+    sysctl --system
+
+    # Подгружаем модуль ядра, если он еще не загружен
+    modprobe tcp_bbr 2>/dev/null
 
     if lsmod | grep -q tcp_bbr && sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
         echo -e "${GREEN}BBR и системные параметры успешно настроены.${RESET}"
     else
-        echo -e "${YELLOW}BBR или системные параметры могут потребовать перезагрузки системы для вступления в силу.${RESET}"
+        echo -e "${YELLOW}Возможно, для применения настроек BBR или системных параметров потребуется перезагрузка.${RESET}"
     fi
 }
 
@@ -64,16 +69,16 @@ EOF
 enable_bbr() {
     echo -e "${YELLOW}Включение стандартного BBR...${RESET}"
     
-    # Проверка, уже включен ли BBR
+    # Проверка, включен ли BBR уже
     if lsmod | grep -q "^tcp_bbr" && sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
-        echo -e "${GREEN}BBR уже включён.${RESET}"
+        echo -e "${GREEN}BBR уже включен.${RESET}"
         return 0
     fi
     
     configure_system_and_bbr
 }
 
-# Установка XanMod BBR v3
+# Установка BBR v3 (Ядро XanMod)
 install_xanmod_bbr() {
     echo -e "${YELLOW}Подготовка к установке ядра XanMod...${RESET}"
     
@@ -83,13 +88,13 @@ install_xanmod_bbr() {
         return 1
     fi
     
-    # Проверка системы
+    # Проверка операционной системы
     if ! grep -Eqi "debian|ubuntu" /etc/os-release; then
         echo -e "${RED}Ошибка: поддерживаются только системы Debian/Ubuntu${RESET}"
         return 1
     fi
     
-    # Добавление PGP-ключа
+    # Регистрация PGP-ключа
     wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg --yes
     
     # Добавление репозитория
@@ -98,23 +103,23 @@ install_xanmod_bbr() {
     # Обновление списка пакетов
     apt update -y
     
-    # Попытка установить последнюю версию
-    echo -e "${YELLOW}Пробуем установить последнюю версию ядра...${RESET}"
+    # Попытка установить последнюю версию ядра
+    echo -e "${YELLOW}Попытка установить последнюю версию ядра...${RESET}"
     if apt install -y linux-xanmod-x64v4; then
         echo -e "${GREEN}Последняя версия ядра успешно установлена${RESET}"
     else
-        echo -e "${YELLOW}Не удалось установить последнюю версию, пробуем старую...${RESET}"
+        echo -e "${YELLOW}Не удалось установить последнюю версию, попытка установить совместимую версию...${RESET}"
         if apt install -y linux-xanmod-x64v2; then
             echo -e "${GREEN}Совместимая версия ядра успешно установлена${RESET}"
         else
-            echo -e "${RED}Не удалось установить ядро${RESET}"
+            echo -e "${RED}Ошибка установки ядра${RESET}"
             return 1
         fi
     fi
     
     configure_system_and_bbr
     
-    echo -e "${GREEN}Установка ядра XanMod завершена. Пожалуйста, перезагрузите систему для применения нового ядра.${RESET}"
+    echo -e "${GREEN}Установка ядра XanMod завершена. Перезагрузите систему, чтобы использовать новое ядро.${RESET}"
     read -p "Перезагрузить систему сейчас? [y/N] " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
@@ -126,21 +131,22 @@ install_xanmod_bbr() {
 install_bbr3_manual() {
     echo -e "${YELLOW}Подготовка к ручной компиляции и установке BBR v3...${RESET}"
     
-    # Установка зависимостей
+    # Установка зависимостей для компиляции
     apt update
-    apt install -y build-essential git
+    # ИСПРАВЛЕНИЕ: добавлены linux-headers и другие необходимые зависимости
+    apt install -y build-essential git bison flex libssl-dev libelf-dev bc linux-headers-$(uname -r)
     
-    # Клонирование исходников
+    # Клонирование исходного кода
     git clone -b v3 https://github.com/google/bbr.git
     cd bbr
     
-    # Сборка и установка
+    # ВНИМАНИЕ: Компиляция целого ядра (make) займет очень много времени!
     make
     make install
     
     configure_system_and_bbr
     
-    echo -e "${GREEN}BBR v3 успешно скомпилирован и установлен${RESET}"
+    echo -e "${GREEN}Компиляция и установка BBR v3 завершены${RESET}"
     read -p "Перезагрузить систему сейчас? [y/N] " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
@@ -154,10 +160,14 @@ main_menu() {
         echo -e "\n${CYAN}Меню управления BBR${RESET}"
         echo -e "${YELLOW}1. Включить стандартный BBR${RESET}"
         echo -e "${YELLOW}2. Установить BBR v3 (версия XanMod)${RESET}"
-        echo -e "${YELLOW}3. Установить BBR v3 (ручная сборка)${RESET}"
+        echo -e "${YELLOW}3. Установить BBR v3 (ручная компиляция - ОСТОРОЖНО)${RESET}"
         echo -e "${YELLOW}4. Вернуться в предыдущее меню${RESET}"
         echo -e "${YELLOW}5. Выйти из скрипта${RESET}"
-        read -p "Выберите действие [1-5]: " choice
+        if ! read -rp "Выберите действие [1-5]: " choice; then
+            echo
+            echo -e "${YELLOW}Ввод не распознан, выход из меню BBR.${RESET}"
+            return 0
+        fi
 
         case "$choice" in
             1)
@@ -176,7 +186,7 @@ main_menu() {
                 exit 0
                 ;;
             *)
-                echo -e "${RED}Недопустимый выбор${RESET}"
+                echo -e "${RED}Неверный выбор${RESET}"
                 ;;
         esac
     done
