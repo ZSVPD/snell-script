@@ -3,7 +3,7 @@
 # Автор: jinqians
 # Дата: 16 марта 2025
 # Сайт: jinqians.com
-# Описание: Этот скрипт используется для установки и управления ShadowTLS V3
+# Описание: Скрипт для установки и управления ShadowTLS V3
 # =========================================
 
 # Определение цветовых кодов
@@ -19,7 +19,7 @@ SYSTEMD_DIR="/etc/systemd/system"
 CONFIG_DIR="/etc/shadowtls"
 SERVICE_FILE="${SYSTEMD_DIR}/shadowtls.service"
 
-# Определение каталогов конфигурации
+# Определение путей конфигураций
 SNELL_CONF_DIR="/etc/snell"
 SNELL_CONF_FILE="${SNELL_CONF_DIR}/users/snell-main.conf"
 OLD_SNELL_CONF_FILE="${SNELL_CONF_DIR}/snell-server.conf"
@@ -27,7 +27,120 @@ USERS_DIR="${SNELL_CONF_DIR}/users"
 SNELL_SERVICE_USER="snell"
 SNELL_SERVICE_GROUP="snell"
 
-# Проверка, запущен ли скрипт с правами root
+# =========================================
+# Чтение информации о каналах Snell (read-only подмножество, совместимое с логикой версий snell.sh)
+# Первая строка конфигурации каждого пользователя "#version-choice = vX" указывает, какая версия работает на порту;
+# При отсутствии метки (старая установка до миграции) берется версия самого симлинка snell-server.
+# =========================================
+SNELL_VERSION_MARKER_KEY="version-choice"
+
+snell_binary_for_version() {
+    case "$1" in
+        v4|v5|v6) echo "${INSTALL_DIR}/snell-server-$1" ;;
+        *)        echo "${INSTALL_DIR}/snell-server" ;;
+    esac
+}
+
+probe_snell_binary_version() {
+    local binary="$1"
+    if [ ! -x "$binary" ]; then
+        echo "unknown"
+        return 1
+    fi
+
+    local version_output
+    version_output=$("$binary" --v 2>&1)
+    if echo "$version_output" | grep -q "v6"; then
+        echo "v6"
+    elif echo "$version_output" | grep -q "v5"; then
+        echo "v5"
+    else
+        echo "v4"
+    fi
+}
+
+detect_installed_snell_version() {
+    probe_snell_binary_version "${INSTALL_DIR}/snell-server"
+}
+
+read_conf_snell_version() {
+    local conf_file="$1"
+    [ -f "$conf_file" ] || return 1
+
+    local marked
+    marked=$(grep -E "^[[:space:]]*#[[:space:]]*${SNELL_VERSION_MARKER_KEY}[[:space:]]*=" "$conf_file" \
+        | head -n 1 | awk -F'=' '{print $2}' | tr -d '[:space:]')
+    case "$marked" in
+        v4|v5|v6) echo "$marked" ;;
+        *)        return 1 ;;
+    esac
+}
+
+get_conf_snell_version() {
+    local conf_file="$1"
+    local marked
+    if marked=$(read_conf_snell_version "$conf_file"); then
+        echo "$marked"
+        return 0
+    fi
+    detect_installed_snell_version
+}
+
+snell_conf_for_port() {
+    local port="$1"
+    local main_port
+    main_port=$(get_snell_port 2>/dev/null)
+    if [ -n "$main_port" ] && [ "$port" = "$main_port" ]; then
+        echo "$SNELL_CONF_FILE"
+    else
+        echo "${USERS_DIR}/snell-${port}.conf"
+    fi
+}
+
+# Бэкенд-порт -> версия Snell, запущенная на этом порту
+get_port_snell_version() {
+    get_conf_snell_version "$(snell_conf_for_port "$1")"
+}
+
+# Бэкенд-порт -> режим mode для v6 (на клиенте и сервере должен совпадать)
+get_port_snell_mode() {
+    local conf_file mode=""
+    conf_file=$(snell_conf_for_port "$1")
+    if [ -f "$conf_file" ]; then
+        mode=$(grep -E '^[[:space:]]*mode[[:space:]]*=' "$conf_file" | head -n 1 | awk -F'=' '{print $2}' | tr -d ' ')
+    fi
+    echo "${mode:-default}"
+}
+
+# Генерация строки прокси Surge для соответствующего порта бэкенда (с параметрами ShadowTLS)
+print_snell_shadowtls_line() {
+    local label="$1"
+    local server_ip="$2"
+    local stls_port="$3"
+    local psk="$4"
+    local stls_password="$5"
+    local stls_sni="$6"
+    local backend_port="$7"
+
+    local version stls_suffix
+    version=$(get_port_snell_version "$backend_port")
+    stls_suffix="reuse = true, tfo = true, shadow-tls-password = ${stls_password}, shadow-tls-sni = ${stls_sni}, shadow-tls-version = 3"
+
+    case "$version" in
+        v6)
+            echo -e "${label} (v6) = snell, ${server_ip}, ${stls_port}, psk = ${psk}, version = 6, mode = $(get_port_snell_mode "$backend_port"), ${stls_suffix}"
+            ;;
+        v5)
+            echo -e "${label} (v4) = snell, ${server_ip}, ${stls_port}, psk = ${psk}, version = 4, ${stls_suffix}"
+            echo -e "${label} (v5) = snell, ${server_ip}, ${stls_port}, psk = ${psk}, version = 5, ${stls_suffix}"
+            ;;
+        *)
+            echo -e "${label} (v4) = snell, ${server_ip}, ${stls_port}, psk = ${psk}, version = 4, ${stls_suffix}"
+            ;;
+    esac
+}
+
+# Проверка прав root
 check_root() {
     if [ "$(id -u)" != "0" ]; then
         echo -e "${RED}Пожалуйста, запустите этот скрипт с правами root${RESET}"
@@ -35,7 +148,7 @@ check_root() {
     fi
 }
 
-# Установка необходимых зависимостей
+# Установка необходимых утилит
 install_requirements() {
     apt update
     apt install -y wget curl jq
@@ -47,15 +160,15 @@ SHADOWTLS_FALLBACK_VERSION="v0.2.25"
 get_latest_version() {
     local latest_version=""
 
-    # Приоритет API; при неудаче jq может вернуть "null"
+    # В первую очередь запрос к API; при ошибке jq может вернуть "null"
     latest_version=$(curl -fsSL --connect-timeout 10 "https://api.github.com/repos/ihciah/shadow-tls/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null)
 
-    # При сбоях API (например, лимит запросов), откат на редирект releases/latest
+    # При сбое API (например, rate-limit), откат к редиректу releases/latest
     if [ -z "$latest_version" ] || [ "$latest_version" = "null" ]; then
         latest_version=$(curl -fsSL --connect-timeout 10 -o /dev/null -w '%{url_effective}' "https://github.com/ihciah/shadow-tls/releases/latest" 2>/dev/null | sed -E 's#.*/tag/##')
     fi
 
-    # Если оба варианта не сработали, использовать встроенную проверенную версию
+    # Если оба варианта завершились неудачей, использовать встроенную рабочую версию
     if [ -z "$latest_version" ] || [ "$latest_version" = "null" ]; then
         echo -e "${YELLOW}Не удалось получить последнюю версию с GitHub, используется встроенная версия ${SHADOWTLS_FALLBACK_VERSION}${RESET}" >&2
         latest_version="$SHADOWTLS_FALLBACK_VERSION"
@@ -64,7 +177,7 @@ get_latest_version() {
     echo "$latest_version"
 }
 
-# Проверка установки SS (Shadowsocks Rust)
+# Проверка, установлен ли Shadowsocks-Rust
 check_ssrust() {
     if [ ! -f "/usr/local/bin/ss-rust" ]; then
         return 1
@@ -72,7 +185,7 @@ check_ssrust() {
     return 0
 }
 
-# Проверка установки Snell
+# Проверка, установлен ли Snell
 check_snell() {
     if [ ! -f "/usr/local/bin/snell-server" ]; then
         return 1
@@ -94,7 +207,7 @@ save_nftables_rules() {
         systemctl enable nftables >/dev/null 2>&1 || true
         echo -e "${GREEN}Правила nftables сохранены${RESET}"
     else
-        echo -e "${YELLOW}Файл конфигурации nftables не найден, правила для портов применены в текущей сессии${RESET}"
+        echo -e "${YELLOW}Файл сохранения правил nftables не найден, правила применены только для текущей сессии${RESET}"
     fi
 }
 
@@ -271,25 +384,25 @@ check_snell_config() {
     migrate_legacy_snell_config || true
 
     if [ ! -s "${SNELL_CONF_FILE}" ]; then
-        echo -e "${RED}Основной файл конфигурации Snell не существует: ${SNELL_CONF_FILE}${RESET}"
-        echo -e "${YELLOW}Сначала выполните установку/восстановление Snell или перенесите старую конфигурацию ${OLD_SNELL_CONF_FILE} в папку users.${RESET}"
+        echo -e "${RED}Основной конфигурационный файл Snell не существует: ${SNELL_CONF_FILE}${RESET}"
+        echo -e "${YELLOW}Пожалуйста, сначала выполните установку/восстановление Snell или переместите старый конфиг ${OLD_SNELL_CONF_FILE} в каталог users.${RESET}"
         return 1
     fi
 
     if ! grep -Eq '^[[:space:]]*listen[[:space:]]*=' "${SNELL_CONF_FILE}"; then
-        echo -e "${RED}В основной конфигурации Snell отсутствует параметр listen: ${SNELL_CONF_FILE}${RESET}"
+        echo -e "${RED}В основном конфиге Snell отсутствует параметр listen: ${SNELL_CONF_FILE}${RESET}"
         return 1
     fi
 
     if ! grep -Eq '^[[:space:]]*psk[[:space:]]*=' "${SNELL_CONF_FILE}"; then
-        echo -e "${RED}В основной конфигурации Snell отсутствует параметр psk: ${SNELL_CONF_FILE}${RESET}"
+        echo -e "${RED}В основном конфиге Snell отсутствует параметр psk: ${SNELL_CONF_FILE}${RESET}"
         return 1
     fi
 
     return 0
 }
 
-# Получение порта SS
+# Получение порта Shadowsocks
 get_ssrust_port() {
     local ssrust_conf="/etc/ss-rust/config.json"
     if [ ! -f "$ssrust_conf" ]; then
@@ -299,7 +412,7 @@ get_ssrust_port() {
     echo "$port"
 }
 
-# Получение пароля SS
+# Получение пароля Shadowsocks
 get_ssrust_password() {
     local ssrust_conf="/etc/ss-rust/config.json"
     if [ ! -f "$ssrust_conf" ]; then
@@ -309,7 +422,7 @@ get_ssrust_password() {
     echo "$password"
 }
 
-# Получение метода шифрования SS
+# Получение метода шифрования Shadowsocks
 get_ssrust_method() {
     local ssrust_conf="/etc/ss-rust/config.json"
     if [ ! -f "$ssrust_conf" ]; then
@@ -327,7 +440,7 @@ get_snell_port() {
     fi
 }
 
-# Получение Snell PSK
+# Получение PSK ключа Snell
 get_snell_psk() {
     local snell_conf="${SNELL_CONF_FILE}"
     migrate_legacy_snell_config >/dev/null 2>&1 || true
@@ -358,16 +471,16 @@ get_snell_config() {
     echo "$psk"
 }
 
-# Получение всех конфигураций пользователей Snell
+# Получение конфигураций всех пользователей Snell
 get_all_snell_users() {
     migrate_legacy_snell_config >/dev/null 2>&1 || true
 
-    # Проверка наличия каталога конфигураций
+    # Проверка существования директории пользовательских конфигураций
     if [ ! -d "${USERS_DIR}" ]; then
         return 1
     fi
     
-    # Сначала получаем основную конфигурацию
+    # Сначала получить конфигурацию основного пользователя
     local main_port=""
     local main_psk=""
     if [ -f "${SNELL_CONF_FILE}" ]; then
@@ -378,7 +491,7 @@ get_all_snell_users() {
         fi
     fi
     
-    # Получение конфигураций остальных пользователей
+    # Получить конфигурации остальных пользователей
     for user_conf in "${USERS_DIR}"/snell-*.conf; do
         if [ -f "$user_conf" ] && [[ "$user_conf" != *"snell-main.conf" ]]; then
             local port=$(grep -E '^listen' "$user_conf" | sed -n 's/^[[:space:]]*listen[[:space:]]*=.*:\([0-9][0-9]*\).*/\1/p')
@@ -435,23 +548,23 @@ restrict_snell_to_loopback() {
     local service_name
 
     conf=$(get_snell_config_file_by_port "$port") || {
-        echo -e "${RED}Не найден конфигурационный файл для Snell порта ${port}${RESET}"
+        echo -e "${RED}Не найден конфигурационный файл для порта Snell ${port}${RESET}"
         return 1
     }
 
     service_name=$(get_snell_service_name_by_config "$conf") || {
-        echo -e "${RED}Не удалось определить службу systemd для Snell порта ${port}${RESET}"
+        echo -e "${RED}Не удалось определить службу systemd для порта Snell ${port}${RESET}"
         return 1
     }
 
     if [ "$service_name" = "snell" ] && { systemctl is-active --quiet snell.socket 2>/dev/null || systemctl is-enabled --quiet snell.socket 2>/dev/null; }; then
-        echo -e "${RED}Обнаружено использование snell.socket. В настоящее время невозможно автоматически переключить основной Snell в режим бэкенда ShadowTLS${RESET}"
-        echo -e "${YELLOW}Пожалуйста, сначала отключите режим управления исходящим трафиком/активацию сокетов в скрипте управления Snell, а затем настраивайте ShadowTLS.${RESET}"
+        echo -e "${RED}Обнаружено использование snell.socket; автоматический перевод основного Snell в режим ShadowTLS-бэкенда пока невозможен${RESET}"
+        echo -e "${YELLOW}Пожалуйста, отключите socket-активацию в скрипте управления Snell перед настройкой ShadowTLS.${RESET}"
         return 1
     fi
 
     if grep -Eq "^[[:space:]]*listen[[:space:]]*=[[:space:]]*127\\.0\\.0\\.1:${port}[[:space:]]*$" "$conf"; then
-        echo -e "${GREEN}Snell порт ${port} уже прослушивает только 127.0.0.1${RESET}"
+        echo -e "${GREEN}Порт Snell ${port} уже слушает только 127.0.0.1${RESET}"
     else
         cp -a "$conf" "${conf}.bak.$(date +%Y%m%d%H%M%S)"
         sed -i "s|^[[:space:]]*listen[[:space:]]*=.*:${port}[[:space:]]*$|listen = 127.0.0.1:${port}|" "$conf"
@@ -466,30 +579,32 @@ restrict_snell_to_loopback() {
         fi
         chmod 644 "$conf" 2>/dev/null || true
 
-        echo -e "${GREEN}Snell порт ${port} успешно изменен на прослушивание только 127.0.0.1${RESET}"
+        echo -e "${GREEN}Порт Snell ${port} переведен на локальный адрес 127.0.0.1${RESET}"
     fi
 
     systemctl restart "$service_name"
     close_port "$port"
-    echo -e "${GREEN}Правила доступа к оригинальному порту Snell ${port} извне закрыты. Клиенты должны подключаться к порту ShadowTLS${RESET}"
+    echo -e "${GREEN}Внешний доступ к исходному порту Snell ${port} закрыт в фаерволе; клиенты должны подключаться через порт ShadowTLS${RESET}"
 }
 
-# Получение версии Snell
+# Получение мажорной версии Snell (4 / 5 / 6) для бэкенд-порта
+# Если порт не передан, возвращается версия для порта основного пользователя.
 get_snell_version() {
-    if ! command -v snell-server &> /dev/null; then
-        return 1
-    fi
-    
-    # Попытка получить информацию о версии
-    local version_output=$(snell-server --v 2>&1)
-    
-    # Проверка, является ли версия v5
-    if echo "$version_output" | grep -q "v5"; then
-        echo "5"
+    local port="${1:-$(get_snell_port)}"
+    local version
+
+    if [ -z "$port" ]; then
+        version=$(detect_installed_snell_version)
     else
-        # По умолчанию v4
-        echo "4"
+        version=$(get_port_snell_version "$port")
     fi
+
+    case "$version" in
+        v6) echo "6" ;;
+        v5) echo "5" ;;
+        v4) echo "4" ;;
+        *)  return 1 ;;
+    esac
 }
 
 # Получение IP-адреса сервера
@@ -497,15 +612,15 @@ get_server_ip() {
     local ipv4
     local ipv6
     
-    # Получение IPv4
+    # Получение адреса IPv4
     ipv4=$(curl -s -4 ip.sb 2>/dev/null)
     
-    # Получение IPv6
+    # Получение адреса IPv6
     ipv6=$(curl -s -6 ip.sb 2>/dev/null)
     
-    # Выбор IP и возврат
+    # Определение типа IP и возврат значения
     if [ -n "$ipv4" ] && [ -n "$ipv6" ]; then
-        # Dual-stack, приоритет IPv4
+        # Dual-stack, приоритет отдается IPv4
         echo "$ipv4"
     elif [ -n "$ipv4" ]; then
         # Только IPv4
@@ -521,16 +636,16 @@ get_server_ip() {
     return 0
 }
 
-# Проверка формата команды shadow-tls
+# Проверка формата команд shadow-tls
 check_shadowtls_command() {
     local help_output
     help_output=$($INSTALL_DIR/shadow-tls --help 2>&1)
-    echo -e "${YELLOW}Справка Shadow-tls:${RESET}"
+    echo -e "${YELLOW}Справка shadow-tls:${RESET}"
     echo "$help_output"
     return 0
 }
 
-# Генерация безопасного Base64
+# Генерация безопасного Base64 (URL-safe)
 urlsafe_base64() {
     date=$(echo -n "$1"|base64|sed ':a;N;s/\n/ /g;ta'|sed 's/ //g;s/=//g;s/+/-/g;s/\//_/g')
     echo -e "${date}"
@@ -560,11 +675,11 @@ check_port_usage() {
     return 1     # Порт свободен
 }
 
-# Получение портов, уже используемых ShadowTLS
+# Получение уже используемых портов ShadowTLS
 get_used_stls_ports() {
     local used_ports=()
     
-    # Проверка службы SS
+    # Проверка службы Shadowsocks
     local ss_service="${SYSTEMD_DIR}/shadowtls-ss.service"
     if [ -f "$ss_service" ]; then
         local ss_port=$(grep -oP '(?<=--listen ::0:)\d+' "$ss_service")
@@ -587,14 +702,14 @@ get_used_stls_ports() {
     echo "${used_ports[@]}"
 }
 
-# Проверка и получение доступного порта
+# Проверка и выбор доступного порта
 get_available_port() {
     local port=$1
     local used_ports=($(get_used_stls_ports))
     
-    # Если пользователь указал порт
+    # Если порт указан пользователем
     if [ ! -z "$port" ]; then
-        # Проверка, используется ли порт уже в ShadowTLS
+        # Проверка, не используется ли порт другой службой ShadowTLS
         for used_port in "${used_ports[@]}"; do
             if [ "$port" = "$used_port" ]; then
                 echo -e "${RED}Порт ${port} уже используется другой службой ShadowTLS${RESET}"
@@ -602,7 +717,7 @@ get_available_port() {
             fi
         done
         
-        # Проверка занятости порта другими сервисами
+        # Проверка, не занят ли порт сторонними службами в системе
         if check_port_usage "$port"; then
             echo -e "${RED}Порт ${port} уже занят другой службой${RESET}"
             return 1
@@ -612,13 +727,13 @@ get_available_port() {
         return 0
     fi
     
-    # Если порт не указан, генерируем случайный
+    # Если порт не указан, генерация случайного
     local attempts=0
     while [ $attempts -lt 10 ]; do
         local random_port=$(generate_random_port)
         local is_used=0
         
-        # Проверка на использование в ShadowTLS
+        # Проверка среди портов ShadowTLS
         for used_port in "${used_ports[@]}"; do
             if [ "$random_port" = "$used_port" ]; then
                 is_used=1
@@ -626,7 +741,7 @@ get_available_port() {
             fi
         done
         
-        # Если порт свободен
+        # Если свободен в ShadowTLS и не занят в системе
         if [ $is_used -eq 0 ] && ! check_port_usage "$random_port"; then
             echo "$random_port"
             return 0
@@ -635,11 +750,11 @@ get_available_port() {
         attempts=$((attempts + 1))
     done
     
-    echo -e "${RED}Не удалось найти доступный порт${RESET}"
+    echo -e "${RED}Не удалось найти свободный порт${RESET}"
     return 1
 }
 
-# Генерация ссылок и конфигурации для SS
+# Генерация ссылок и конфигураций Shadowsocks
 generate_ss_links() {
     local server_ip=$1
     local listen_port=$2
@@ -650,35 +765,34 @@ generate_ss_links() {
     local backend_port=$7
     
     echo -e "\n${YELLOW}=== Конфигурация сервера ===${RESET}"
-    echo -e "IP-адрес сервера: ${server_ip}"
-    echo -e "\nКонфигурация Shadowsocks:"
+    echo -e "IP сервера: ${server_ip}"
+    echo -e "\nПараметры Shadowsocks:"
     echo -e "  - Порт: ${backend_port}"
     echo -e "  - Метод шифрования: ${ssrust_method}"
     echo -e "  - Пароль: ${ssrust_password}"
-    echo -e "\nКонфигурация ShadowTLS:"
+    echo -e "\nПараметры ShadowTLS:"
     echo -e "  - Порт: ${listen_port}"
     echo -e "  - Пароль: ${stls_password}"
     echo -e "  - SNI: ${stls_sni}"
     echo -e "  - Версия: 3"
     
-    # Генерация комбинированной ссылки SS + ShadowTLS
+    # Генерация объединенной ссылки SS + ShadowTLS
     local userinfo=$(echo -n "${ssrust_method}:${ssrust_password}" | base64 | tr -d '\n')
-    # shadow_tls_config = plugin=shadow-tls;host=${stls_sni};password=${stls_password};version=3
     local shadow_tls_config="plugin=shadow-tls;host=${stls_sni};password=${stls_password};version=3"
     local ss_url="ss://${userinfo}@${server_ip}:${listen_port}?${shadow_tls_config}"
 
-    echo -e "\n${YELLOW}=== Конфигурация Surge ===${RESET}"
+    echo -e "\n${YELLOW}=== Конфигурация для Surge ===${RESET}"
     echo -e "SS-${server_ip} = ss, ${server_ip}, ${listen_port}, encrypt-method=${ssrust_method}, password=${ssrust_password}, shadow-tls-password=${stls_password}, shadow-tls-sni=${stls_sni}, shadow-tls-version=3, udp-relay=true"
     
     echo -e "\n${YELLOW}=== Инструкция по настройке Shadowrocket ===${RESET}"
-    echo -e "1. Добавление узла Shadowsocks:"
+    echo -e "1. Добавьте узел Shadowsocks:"
     echo -e "   - Тип: Shadowsocks"
     echo -e "   - Адрес: ${server_ip}"
     echo -e "   - Порт: ${backend_port}"
     echo -e "   - Метод шифрования: ${ssrust_method}"
     echo -e "   - Пароль: ${ssrust_password}"
     
-    echo -e "\n2. Добавление узла ShadowTLS:"
+    echo -e "\n2. Добавьте узел ShadowTLS:"
     echo -e "   - Тип: ShadowTLS"
     echo -e "   - Адрес: ${server_ip}"
     echo -e "   - Порт: ${listen_port}"
@@ -692,7 +806,7 @@ generate_ss_links() {
     echo -e "\n${YELLOW}=== QR-код для Shadowrocket ===${RESET}"
     qrencode -t UTF8 "${ss_url}"
     
-    echo -e "\n${YELLOW}=== Конфигурация Clash Meta ===${RESET}"
+    echo -e "\n${YELLOW}=== Конфигурация для Clash Meta ===${RESET}"
     echo -e "proxies:"
     echo -e "  - name: SS-${server_ip}"
     echo -e "    type: ss"
@@ -707,7 +821,7 @@ generate_ss_links() {
     echo -e "      version: 3"
 }
 
-# Генерация ссылок и конфигурации для Snell
+# Генерация ссылок и конфигураций Snell
 generate_snell_links() {
     local server_ip=$1
     local listen_port=$2
@@ -716,37 +830,33 @@ generate_snell_links() {
     local stls_sni=$5
     local backend_port=$6
     
-    # Получение версии Snell
-    local snell_version=$(get_snell_version)
+    # Версия берется из конфигурации конкретного бэкенд-порта
+    local snell_version=$(get_snell_version "$backend_port")
     
     echo -e "\n${YELLOW}=== Конфигурация сервера ===${RESET}"
-    echo -e "IP-адрес сервера: ${server_ip}"
-    echo -e "\nКонфигурация Snell:"
+    echo -e "IP сервера: ${server_ip}"
+    echo -e "\nПараметры Snell:"
     echo -e "  - Порт: ${backend_port}"
     echo -e "  - PSK: ${snell_psk}"
     echo -e "  - Версия: ${snell_version}"
-    echo -e "\nКонфигурация ShadowTLS:"
+    echo -e "\nПараметры ShadowTLS:"
     echo -e "  - Порт: ${listen_port}"
     echo -e "  - Пароль: ${stls_password}"
     echo -e "  - SNI: ${stls_sni}"
     echo -e "  - Версия: 3"
     
-    echo -e "\n${YELLOW}=== Конфигурация Surge ===${RESET}"
+    echo -e "\n${YELLOW}=== Конфигурация для Surge ===${RESET}"
     
-    # Для v5 выводим форматы v4 и v5, для v4 только v4
-    if [ "$snell_version" = "5" ]; then
-        echo -e "Snell v4 + ShadowTLS = snell, ${server_ip}, ${listen_port}, psk = ${snell_psk}, version = 4, reuse = true, tfo = true, shadow-tls-password = ${stls_password}, shadow-tls-sni = ${stls_sni}, shadow-tls-version = 3"
-        echo -e "Snell v5 + ShadowTLS = snell, ${server_ip}, ${listen_port}, psk = ${snell_psk}, version = 5, reuse = true, tfo = true, shadow-tls-password = ${stls_password}, shadow-tls-sni = ${stls_sni}, shadow-tls-version = 3"
-    else
-        echo -e "Snell + ShadowTLS = snell, ${server_ip}, ${listen_port}, psk = ${snell_psk}, version = 4, reuse = true, tfo = true, shadow-tls-password = ${stls_password}, shadow-tls-sni = ${stls_sni}, shadow-tls-version = 3"
-    fi
+    # Для v5 выводятся варианты записи v4 и v5; для v6 дополнительно передается параметр mode
+    print_snell_shadowtls_line "Snell + ShadowTLS" "$server_ip" "$listen_port" "$snell_psk" \
+        "$stls_password" "$stls_sni" "$backend_port"
 }
 
 # Запрос на включение wildcard-sni (по умолчанию выключено)
 prompt_wildcard_sni() {
     wildcard_sni="off"
-    echo -e "${YELLOW}Включить wildcard-sni=authed?${RESET}"
-    echo -e "После включения клиенты, прошедшие аутентификацию по паролю, смогут использовать домен для маскировки (SNI), отличающийся от серверного."
+    echo -e "${YELLOW}Включить режим wildcard-sni=authed?${RESET}"
+    echo -e "После включения авторизованные клиенты смогут использовать SNI, отличный от серверного"
     read -rp "Включить wildcard-sni=authed? [y/N]: " wildcard_choice
     case "$wildcard_choice" in
         [yY]|[yY][eE][sS])
@@ -754,17 +864,17 @@ prompt_wildcard_sni() {
             echo -e "${GREEN}Параметр wildcard-sni=authed включен${RESET}"
             ;;
         *)
-            echo -e "${GREEN}Оставлено по умолчанию (wildcard-sni выключен)${RESET}"
+            echo -e "${GREEN}Оставлено значение по умолчанию (wildcard-sni выключен)${RESET}"
             ;;
     esac
 }
 
 # Включение TCP Fast Open
 enable_tcp_fastopen() {
-    # Применить немедленно
+    # Применение немедленно
     sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1
 
-    # Сохранить конфигурацию для применения после перезагрузки
+    # Сохранение конфигурации для применения после перезагрузки
     if [ -d /etc/sysctl.d ]; then
         echo "net.ipv4.tcp_fastopen = 3" > /etc/sysctl.d/99-tcp-fastopen.conf
     elif ! grep -q "^net.ipv4.tcp_fastopen" /etc/sysctl.conf 2>/dev/null; then
@@ -772,7 +882,7 @@ enable_tcp_fastopen() {
     fi
 }
 
-# Создание шаблона файла службы
+# Шаблон создания unit-файла systemd
 create_shadowtls_service() {
     local service_type=$1  # ss или snell
     local port=$2
@@ -785,18 +895,18 @@ create_shadowtls_service() {
     
     if [ "$service_type" = "ss" ]; then
         service_file="${SYSTEMD_DIR}/shadowtls-ss.service"
-        description="Служба сервера Shadow-TLS для Shadowsocks"
+        description="Служба Shadow-TLS Server для Shadowsocks"
         identifier="shadow-tls-ss"
     else
         service_file="${SYSTEMD_DIR}/shadowtls-snell-${port}.service"
-        description="Служба сервера Shadow-TLS для Snell (Порт: ${port})"
+        description="Служба Shadow-TLS Server для Snell (Порт: ${port})"
         identifier="shadow-tls-snell-${port}"
     fi
 
     # Включение TCP Fast Open (параметры ядра)
     enable_tcp_fastopen
 
-    # Параметр wildcard-sni (по умолчанию off, флаг не добавляется)
+    # Флаг wildcard-sni (по умолчанию off, аргумент не добавляется)
     local wildcard_sni_flag=""
     if [ "$wildcard_sni" = "authed" ] || [ "$wildcard_sni" = "all" ]; then
         wildcard_sni_flag=" --wildcard-sni ${wildcard_sni}"
@@ -841,7 +951,7 @@ ProtectHome=yes
 PrivateTmp=yes
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
-# Параметры оптимизации системы
+# Параметры системной оптимизации
 Environment=RUST_THREADS=1
 Environment=MONOIO_FORCE_LEGACY_DRIVER=1
 Environment=RUST_LOG_LEVEL=info
@@ -853,7 +963,7 @@ Environment=RUST_LOG_FILTER=info,shadow_tls=info
 WantedBy=multi-user.target
 EOF
 
-    # Создание лог-файла и настройка прав
+    # Создание файла лога и установка прав доступа
     touch "/var/log/shadowtls-${identifier}.log"
     chmod 640 "/var/log/shadowtls-${identifier}.log"
     chown root:root "/var/log/shadowtls-${identifier}.log"
@@ -865,7 +975,7 @@ install_shadowtls() {
 
     install_requirements
     
-    # Обнаружение установленных протоколов
+    # Проверка установленных протоколов
     local has_ss=false
     local has_snell=false
     
@@ -878,11 +988,11 @@ install_shadowtls() {
         has_snell=true
         echo -e "${GREEN}Обнаружен установленный Snell${RESET}"
     elif check_snell; then
-        echo -e "${YELLOW}Обнаружен бинарный файл Snell, но основная конфигурация недоступна. Настройка ShadowTLS для Snell пока невозможна.${RESET}"
+        echo -e "${YELLOW}Бинарный файл Snell найден, но основной конфиг недоступен. Настройка ShadowTLS для Snell пока невозможна${RESET}"
     fi
     
     if ! $has_ss && ! $has_snell; then
-        echo -e "${RED}Shadowsocks Rust или Snell не обнаружены, пожалуйста, сначала установите один из них${RESET}"
+        echo -e "${RED}Не обнаружены Shadowsocks Rust или Snell. Сначала установите один из них${RESET}"
         return 1
     fi
     
@@ -910,40 +1020,40 @@ install_shadowtls() {
     # Получение последней версии
     version=$(get_latest_version)
 
-    # Попытка скачивания: сначала напрямую с GitHub, при неудаче - через зеркало ghproxy
+    # Попытка загрузки: сначала напрямую с GitHub, при сбое через зеркало ghproxy
     binary_name="shadow-tls-${arch}"
     github_url="https://github.com/ihciah/shadow-tls/releases/download/${version}/${binary_name}"
     proxy_url="https://ghproxy.com/${github_url}"
 
-    echo -e "${CYAN}Скачивание ShadowTLS ${version} (${arch})...${RESET}"
-    echo -e "${YELLOW}URL для загрузки: ${github_url}${RESET}"
+    echo -e "${CYAN}Загрузка ShadowTLS ${version} (${arch})...${RESET}"
+    echo -e "${YELLOW}URL загрузки: ${github_url}${RESET}"
 
     if ! wget --timeout=30 --tries=2 -q "$github_url" -O "/tmp/shadow-tls.tmp" 2>/dev/null; then
         echo -e "${YELLOW}Прямое подключение к GitHub не удалось, попытка загрузки через зеркало...${RESET}"
         echo -e "${YELLOW}URL зеркала: ${proxy_url}${RESET}"
         if ! wget --timeout=60 --tries=3 "$proxy_url" -O "/tmp/shadow-tls.tmp"; then
-            echo -e "${RED}Не удалось загрузить ShadowTLS, проверьте подключение к сети и повторите попытку${RESET}"
+            echo -e "${RED}Ошибка загрузки ShadowTLS, проверьте сетевое подключение и повторите попытку${RESET}"
             rm -f "/tmp/shadow-tls.tmp"
             exit 1
         fi
     fi
 
-    # Проверка, что загруженный файл не пуст
+    # Проверка, что скачанный файл не пустой
     if [ ! -s "/tmp/shadow-tls.tmp" ]; then
-        echo -e "${RED}Загруженный файл пуст, пожалуйста, повторите попытку${RESET}"
+        echo -e "${RED}Скачанный файл пуст, повторите попытку${RESET}"
         rm -f "/tmp/shadow-tls.tmp"
         exit 1
     fi
     
-    # Перемещение в конечную директорию и установка прав
+    # Перемещение в целевую директорию и установка прав исполнения
     mv "/tmp/shadow-tls.tmp" "$INSTALL_DIR/shadow-tls"
     chmod +x "$INSTALL_DIR/shadow-tls"
     
     # Генерация случайного пароля
     password=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 16)
     
-    # Запрос домена маскировки TLS
-    read -rp "Введите домен для маскировки TLS (нажмите Enter для использования по умолчанию www.microsoft.com): " tls_domain
+    # Запрос маскировочного домена TLS
+    read -rp "Введите домен для TLS маскировки (Enter для значения по умолчанию www.microsoft.com): " tls_domain
     if [ -z "$tls_domain" ]; then
         tls_domain="www.microsoft.com"
     fi
@@ -951,13 +1061,13 @@ install_shadowtls() {
     
     # Выбор протокола для настройки ShadowTLS
     while true; do
-        echo -e "\n${YELLOW}Пожалуйста, выберите протокол для настройки:${RESET}"
+        echo -e "\n${YELLOW}Выберите протокол для настройки:${RESET}"
         echo -e "1. Настроить ShadowTLS для Shadowsocks"
         echo -e "2. Настроить ShadowTLS для Snell"
         echo -e "3. Настроить ShadowTLS для обоих протоколов"
         echo -e "0. Выход"
         
-        read -rp "Ваш выбор [0-3]: " protocol_choice
+        read -rp "Выберите пункт [0-3]: " protocol_choice
         
         case "$protocol_choice" in
             0)
@@ -983,7 +1093,7 @@ install_shadowtls() {
                 ;;
             3)
                 if ! $has_ss || ! $has_snell; then
-                    echo -e "${RED}Необходимы установленные Shadowsocks и Snell${RESET}"
+                    echo -e "${RED}Требуется установка как Shadowsocks, так и Snell${RESET}"
                     continue
                 fi
                 configure_ss=true
@@ -1000,9 +1110,9 @@ install_shadowtls() {
     if $configure_ss; then
         echo -e "\n${YELLOW}Настройка ShadowTLS для Shadowsocks...${RESET}"
         while true; do
-            read -rp "Введите порт прослушивания ShadowTLS (1-65535, нажмите Enter для случайного выбора): " ss_listen_port
+            read -rp "Введите порт прослушивания ShadowTLS (1-65535, Enter для генерации случайного): " ss_listen_port
             
-            # Проверка и получение свободного порта
+            # Проверка и получение доступного порта
             ss_listen_port=$(get_available_port "$ss_listen_port")
             if [ $? -eq 0 ]; then
                 break
@@ -1010,9 +1120,9 @@ install_shadowtls() {
             echo -e "${YELLOW}Пожалуйста, введите порт заново${RESET}"
         done
         
-        echo -e "${GREEN}Будет использоваться порт: ${ss_listen_port}${RESET}"
+        echo -e "${GREEN}Будет использован порт: ${ss_listen_port}${RESET}"
         
-        # Создание службы ShadowTLS для SS
+        # Создание сервиса ShadowTLS для Shadowsocks
         local ss_port=$(get_ssrust_port)
         create_shadowtls_service "ss" "$ss_port" "$ss_listen_port" "$tls_domain" "$password"
         open_port "$ss_listen_port"
@@ -1024,14 +1134,14 @@ install_shadowtls() {
     if $configure_snell; then
         echo -e "\n${YELLOW}Настройка ShadowTLS для Snell...${RESET}"
         
-        # Получение всех конфигураций пользователей Snell
+        # Получение конфигураций пользователей Snell
         local user_configs=$(get_all_snell_users)
         if [ -z "$user_configs" ]; then
             echo -e "${RED}Действующие конфигурации пользователей Snell не найдены${RESET}"
             return 1
         fi
         
-        # Показать все порты Snell
+        # Вывод списка портов Snell
         echo -e "\n${YELLOW}Текущий список портов Snell:${RESET}"
         local port_list=()
         while IFS='|' read -r port psk; do
@@ -1045,8 +1155,8 @@ install_shadowtls() {
             fi
         done <<< "$user_configs"
         
-        # Выбор порта для настройки
-        echo -e "\n${YELLOW}Пожалуйста, выберите порт для настройки:${RESET}"
+        # Выбор портов для настройки
+        echo -e "\n${YELLOW}Выберите порт для настройки:${RESET}"
         echo -e "1-${#port_list[@]}. Выбрать конкретный порт"
         echo -e "0. Настроить ShadowTLS для всех портов"
         
@@ -1057,9 +1167,9 @@ install_shadowtls() {
             for port in "${port_list[@]}"; do
                 echo -e "\n${YELLOW}Настройка ShadowTLS для порта Snell ${port}${RESET}"
                 while true; do
-                    read -rp "Введите порт прослушивания ShadowTLS (1-65535, нажмите Enter для случайного выбора): " stls_port
+                    read -rp "Введите порт прослушивания ShadowTLS (1-65535, Enter для генерации случайного): " stls_port
                     
-                    # Проверка и получение свободного порта
+                    # Проверка и получение доступного порта
                     stls_port=$(get_available_port "$stls_port")
                     if [ $? -eq 0 ]; then
                         break
@@ -1067,11 +1177,11 @@ install_shadowtls() {
                     echo -e "${YELLOW}Пожалуйста, введите порт заново${RESET}"
                 done
                 
-                echo -e "${GREEN}Будет использоваться порт: ${stls_port}${RESET}"
+                echo -e "${GREEN}Будет использован порт: ${stls_port}${RESET}"
                 
                 restrict_snell_to_loopback "$port" || return 1
 
-                # Создание файла службы
+                # Создание unit-файла сервиса
                 create_shadowtls_service "snell" "$port" "$stls_port" "$tls_domain" "$password"
                 open_port "$stls_port"
                 systemctl start "shadowtls-snell-${port}"
@@ -1082,9 +1192,9 @@ install_shadowtls() {
             local selected_port="${port_list[$((port_choice-1))]}"
             echo -e "\n${YELLOW}Настройка ShadowTLS для порта Snell ${selected_port}${RESET}"
             while true; do
-                read -rp "Введите порт прослушивания ShadowTLS (1-65535, нажмите Enter для случайного выбора): " stls_port
+                read -rp "Введите порт прослушивания ShadowTLS (1-65535, Enter для генерации случайного): " stls_port
                 
-                # Проверка и получение свободного порта
+                # Проверка и получение доступного порта
                 stls_port=$(get_available_port "$stls_port")
                 if [ $? -eq 0 ]; then
                     break
@@ -1092,11 +1202,11 @@ install_shadowtls() {
                 echo -e "${YELLOW}Пожалуйста, введите порт заново${RESET}"
             done
             
-            echo -e "${GREEN}Будет использоваться порт: ${stls_port}${RESET}"
+            echo -e "${GREEN}Будет использован порт: ${stls_port}${RESET}"
             
             restrict_snell_to_loopback "$selected_port" || return 1
 
-            # Создание файла службы
+            # Создание unit-файла сервиса
             create_shadowtls_service "snell" "$selected_port" "$stls_port" "$tls_domain" "$password"
             open_port "$stls_port"
             systemctl start "shadowtls-snell-${selected_port}"
@@ -1110,12 +1220,12 @@ install_shadowtls() {
     # Перезагрузка конфигурации systemd
     systemctl daemon-reload
     
-    # Получение IP сервера
+    # Получение IP-адреса сервера
     local server_ip=$(get_server_ip)
     
-    echo -e "\n${GREEN}=== ShadowTLS успешно установлен ===${RESET}"
+    echo -e "\n${GREEN}=== Установка ShadowTLS успешно завершена ===${RESET}"
     
-    # Показать все доступные конфигурации
+    # Вывод всех сгенерированных конфигураций
     if $configure_ss; then
         local ssrust_password=$(get_ssrust_password)
         local ssrust_method=$(get_ssrust_method)
@@ -1142,7 +1252,7 @@ install_shadowtls() {
 uninstall_shadowtls() {
     echo -e "${CYAN}Удаление ShadowTLS...${RESET}"
     
-    # Остановка и отключение службы SS
+    # Остановка и отключение службы Shadowsocks
     if [ -f "${SYSTEMD_DIR}/shadowtls-ss.service" ]; then
         local ss_listen_port
         ss_listen_port=$(sed -n 's/.*--listen .*:\([0-9][0-9]*\).*/\1/p' "${SYSTEMD_DIR}/shadowtls-ss.service" | head -n 1)
@@ -1154,7 +1264,7 @@ uninstall_shadowtls() {
         fi
     fi
     
-    # Остановка и отключение всех служб ShadowTLS, связанных со Snell
+    # Остановка и отключение всех служб ShadowTLS для Snell
     local snell_services=$(find /etc/systemd/system -name "shadowtls-snell-*.service" 2>/dev/null)
     if [ ! -z "$snell_services" ]; then
         while IFS= read -r service_file; do
@@ -1181,9 +1291,9 @@ uninstall_shadowtls() {
 
 # Просмотр конфигурации
 view_config() {
-    echo -e "${CYAN}Получение информации о конфигурации...${RESET}"
+    echo -e "${CYAN}Получение данных конфигурации...${RESET}"
     
-    # Проверка наличия установленных служб
+    # Проверка установленных служб
     local ss_service="${SYSTEMD_DIR}/shadowtls-ss.service"
     local snell_services=$(find /etc/systemd/system -name "shadowtls-snell-*.service" 2>/dev/null | sort -u)
     
@@ -1192,10 +1302,10 @@ view_config() {
         return 1
     fi
     
-    # Получение IP сервера
+    # Получение IP-адреса сервера
     local server_ip=$(get_server_ip)
     
-    # Проверка конфигурации SS
+    # Проверка Shadowsocks и получение параметров
     if [ -f "$ss_service" ] && check_ssrust; then
         echo -e "\n${YELLOW}=== Конфигурация Shadowsocks + ShadowTLS ===${RESET}"
         local ss_listen_port=$(grep -oP '(?<=--listen ::0:)\d+' "$ss_service")
@@ -1208,25 +1318,25 @@ view_config() {
         if [ ! -z "$ss_listen_port" ] && [ ! -z "$tls_domain" ] && [ ! -z "$password" ]; then
             generate_ss_links "${server_ip}" "${ss_listen_port}" "${ssrust_password}" "${ssrust_method}" "${password}" "${tls_domain}" "${ss_port}"
         else
-            echo -e "${RED}Файл конфигурации SS неполный или поврежден${RESET}"
+            echo -e "${RED}Файл конфигурации SS поврежден или неполон${RESET}"
         fi
     fi
     
-    # Проверка конфигурации Snell
+    # Проверка Snell и получение параметров
     if [ ! -z "$snell_services" ] && check_snell; then
         echo -e "\n${YELLOW}=== Конфигурация Snell + ShadowTLS ===${RESET}"
         
-        # Получение всех пользовательских конфигураций
+        # Получение конфигураций всех пользователей
         local user_configs=$(get_all_snell_users)
         if [ ! -z "$user_configs" ]; then
-            # Ассоциативный массив для сохранения обработанных портов
+            # Ассоциативный массив для исключения повторной обработки портов
             declare -A processed_ports
             
             while IFS='|' read -r port psk; do
                 if [ ! -z "$port" ] && [ -z "${processed_ports[$port]}" ]; then
                     processed_ports[$port]=1
                     
-                    # Получение соответствующей конфигурации службы ShadowTLS
+                    # Получение настроек соответствующей службы ShadowTLS
                     local service_file="${SYSTEMD_DIR}/shadowtls-snell-${port}.service"
                     if [ -f "$service_file" ]; then
                         local exec_line=$(grep "ExecStart=" "$service_file")
@@ -1237,51 +1347,47 @@ view_config() {
                         if [ "$port" = "$(get_snell_port)" ]; then
                             echo -e "\n${GREEN}Конфигурация основного пользователя:${RESET}"
                         else
-                            echo -e "\n${GREEN}Конфигурация пользователя (порт Snell: ${port}):${RESET}"
+                            echo -e "\n${GREEN}Конфигурация пользователя (Порт Snell: ${port}):${RESET}"
                         fi
                         
                         if [ ! -z "$stls_port" ] && [ ! -z "$stls_password" ] && [ ! -z "$stls_domain" ]; then
-                            echo -e "${YELLOW}Конфигурация Snell:${RESET}"
+                            echo -e "${YELLOW}Параметры Snell:${RESET}"
                             echo -e "  - Порт: ${port}"
                             echo -e "  - PSK: ${psk}"
                             
-                            echo -e "\n${YELLOW}Конфигурация ShadowTLS:${RESET}"
+                            echo -e "\n${YELLOW}Параметры ShadowTLS:${RESET}"
                             echo -e "  - Порт прослушивания: ${stls_port}"
                             echo -e "  - Пароль: ${stls_password}"
                             echo -e "  - SNI: ${stls_domain}"
                             echo -e "  - Версия: 3"
                             
                             echo -e "\n${GREEN}Конфигурация Surge:${RESET}"
-                            local snell_version=$(get_snell_version)
-                            if [ "$snell_version" = "5" ]; then
-                                echo -e "Snell v4 + ShadowTLS = snell, ${server_ip}, ${stls_port}, psk = ${psk}, version = 4, reuse = true, tfo = true, shadow-tls-password = ${stls_password}, shadow-tls-sni = ${stls_domain}, shadow-tls-version = 3"
-                                echo -e "Snell v5 + ShadowTLS = snell, ${server_ip}, ${stls_port}, psk = ${psk}, version = 5, reuse = true, tfo = true, shadow-tls-password = ${stls_password}, shadow-tls-sni = ${stls_domain}, shadow-tls-version = 3"
-                            else
-                                echo -e "Snell + ShadowTLS = snell, ${server_ip}, ${stls_port}, psk = ${psk}, version = 4, reuse = true, tfo = true, shadow-tls-password = ${stls_password}, shadow-tls-sni = ${stls_domain}, shadow-tls-version = 3"
-                            fi
+                            echo -e "${YELLOW}Версия Snell: $(get_port_snell_version "$port")${RESET}"
+                            print_snell_shadowtls_line "Snell + ShadowTLS" "$server_ip" "$stls_port" "$psk" \
+                                "$stls_password" "$stls_domain" "$port"
                             
-                            # Проверка статуса службы
+                            # Проверка состояния службы
                             local service_status=$(systemctl is-active "shadowtls-snell-${port}")
                             if [ "$service_status" = "active" ]; then
-                                echo -e "\n${GREEN}Статус службы: работает${RESET}"
-                                # Проверка использования порта
+                                echo -e "\n${GREEN}Статус службы: Работает${RESET}"
+                                # Проверка конфликта портов
                                 local port_usage=$(netstat -tuln | grep ":${stls_port}")
                                 local port_count=$(echo "$port_usage" | wc -l)
                                 if [ "$port_count" -gt 1 ]; then
-                                    echo -e "${RED}Внимание: порт ${stls_port} используется несколькими службами!${RESET}"
-                                    echo -e "${YELLOW}Использование порта:${RESET}"
+                                    echo -e "${RED}Внимание: порт ${stls_port} занят несколькими службами!${RESET}"
+                                    echo -e "${YELLOW}Информация о занятости порта:${RESET}"
                                     netstat -tuln | grep ":${stls_port}"
                                 fi
                             else
-                                echo -e "\n${RED}Статус службы: не работает${RESET}"
-                                echo -e "${YELLOW}Пожалуйста, попробуйте перезапустить службу с помощью команды:${RESET}"
+                                echo -e "\n${RED}Статус службы: Не работает${RESET}"
+                                echo -e "${YELLOW}Попробуйте перезапустить службу командой:${RESET}"
                                 echo -e "systemctl restart shadowtls-snell-${port}"
                             fi
                         else
-                            echo -e "${RED}Конфигурация неполная или повреждена${RESET}"
+                            echo -e "${RED}Файл конфигурации поврежден или неполон${RESET}"
                         fi
                     else
-                        echo -e "\n${YELLOW}Не найдена конфигурация ShadowTLS для пользователя (порт: ${port})${RESET}"
+                        echo -e "\n${YELLOW}Конфигурация ShadowTLS для пользователя (порт: ${port}) не найдена${RESET}"
                     fi
                 fi
             done <<< "$user_configs"
@@ -1290,7 +1396,7 @@ view_config() {
         fi
     fi
     
-    # Отображение статуса служб
+    # Вывод статуса служб
     echo -e "\n${YELLOW}=== Статус служб ShadowTLS ===${RESET}"
     
     # Статус службы SS
@@ -1298,14 +1404,14 @@ view_config() {
         echo -e "\n${YELLOW}Статус службы SS:${RESET}"
         systemctl status shadowtls-ss --no-pager
         
-        # Вывод команды перезапуска, если служба не активна
+        # Если служба не запущена, вывести команду перезапуска
         if [ "$(systemctl is-active shadowtls-ss)" != "active" ]; then
-            echo -e "\n${YELLOW}Служба SS не запущена. Попробуйте выполнить команду перезапуска:${RESET}"
+            echo -e "\n${YELLOW}Служба SS не запущена. Команда для перезапуска:${RESET}"
             echo -e "systemctl restart shadowtls-ss"
         fi
     fi
     
-    # Статус служб Snell (избегаем дублирования)
+    # Статус всех служб Snell (без дублирования)
     if [ ! -z "$snell_services" ]; then
         echo -e "\n${YELLOW}Статус служб Snell:${RESET}"
         declare -A shown_services
@@ -1316,9 +1422,9 @@ view_config() {
                 echo -e "\n${GREEN}Статус службы ShadowTLS для порта Snell ${port}:${RESET}"
                 systemctl status "shadowtls-snell-${port}" --no-pager
                 
-                # Вывод команды перезапуска, если служба не активна
+                # Если служба не запущена, вывести команду перезапуска
                 if [ "$(systemctl is-active shadowtls-snell-${port})" != "active" ]; then
-                    echo -e "\n${YELLOW}Служба не запущена. Попробуйте выполнить команду перезапуска:${RESET}"
+                    echo -e "\n${YELLOW}Служба не запущена. Команда для перезапуска:${RESET}"
                     echo -e "systemctl restart shadowtls-snell-${port}"
                 fi
             fi
@@ -1326,11 +1432,11 @@ view_config() {
     fi
 }
 
-# Добавление новой конфигурации ShadowTLS
+# Добавление конфигурации ShadowTLS
 add_shadowtls_config() {
     echo -e "${CYAN}Добавление новой конфигурации ShadowTLS...${RESET}"
     
-    # Определение установленных протоколов
+    # Проверка установленных протоколов
     local has_ss=false
     local has_snell=false
     local has_ss_stls=false
@@ -1348,17 +1454,17 @@ add_shadowtls_config() {
         has_snell=true
         echo -e "${GREEN}Обнаружен установленный Snell${RESET}"
     elif check_snell; then
-        echo -e "${YELLOW}Обнаружен бинарный файл Snell, но основная конфигурация недоступна. Добавление конфигурации ShadowTLS для Snell невозможно.${RESET}"
+        echo -e "${YELLOW}Бинарный файл Snell найден, но основной конфиг недоступен. Добавление конфигурации пока невозможно${RESET}"
     fi
     
     if ! $has_ss && ! $has_snell; then
-        echo -e "${RED}Shadowsocks Rust или Snell не обнаружены, пожалуйста, сначала установите один из них${RESET}"
+        echo -e "${RED}Не обнаружены Shadowsocks Rust или Snell. Сначала установите один из них${RESET}"
         return 1
     fi
     
     # Выбор протокола для добавления конфигурации
     while true; do
-        echo -e "\n${YELLOW}Выберите протокол для добавления новой конфигурации:${RESET}"
+        echo -e "\n${YELLOW}Выберите протокол для добавления конфигурации:${RESET}"
         if $has_ss && ! $has_ss_stls; then
             echo -e "1. Добавить конфигурацию ShadowTLS для Shadowsocks"
         fi
@@ -1378,9 +1484,9 @@ add_shadowtls_config() {
                     echo -e "${RED}Неверный выбор${RESET}"
                     continue
                 fi
-                # Получение необходимой информации
+                # Получение необходимых параметров
                 password=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 16)
-                read -rp "Введите домен для маскировки TLS (нажмите Enter для использования по умолчанию www.microsoft.com): " tls_domain
+                read -rp "Введите домен для TLS маскировки (Enter для значения по умолчанию www.microsoft.com): " tls_domain
                 if [ -z "$tls_domain" ]; then
                     tls_domain="www.microsoft.com"
                 fi
@@ -1388,9 +1494,9 @@ add_shadowtls_config() {
                 
                 # Настройка ShadowTLS для SS
                 while true; do
-                    read -rp "Введите порт прослушивания ShadowTLS (1-65535, нажмите Enter для случайного выбора): " ss_listen_port
+                    read -rp "Введите порт прослушивания ShadowTLS (1-65535, Enter для генерации случайного): " ss_listen_port
                     
-                    # Проверка и получение свободного порта
+                    # Проверка и получение доступного порта
                     ss_listen_port=$(get_available_port "$ss_listen_port")
                     if [ $? -eq 0 ]; then
                         break
@@ -1398,14 +1504,14 @@ add_shadowtls_config() {
                     echo -e "${YELLOW}Пожалуйста, введите порт заново${RESET}"
                 done
                 
-                # Создание службы
+                # Создание службы ShadowTLS для SS
                 local ss_port=$(get_ssrust_port)
                 create_shadowtls_service "ss" "$ss_port" "$ss_listen_port" "$tls_domain" "$password"
                 open_port "$ss_listen_port"
                 systemctl start shadowtls-ss
                 systemctl enable shadowtls-ss
                 
-                # Отображение информации о конфигурации
+                # Вывод конфигурации
                 local server_ip=$(get_server_ip)
                 local ssrust_password=$(get_ssrust_password)
                 local ssrust_method=$(get_ssrust_method)
@@ -1418,23 +1524,23 @@ add_shadowtls_config() {
                     continue
                 fi
                 
-                # Получение необходимой информации
+                # Получение необходимых параметров
                 password=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 16)
-                read -rp "Введите домен для маскировки TLS (нажмите Enter для использования по умолчанию www.microsoft.com): " tls_domain
+                read -rp "Введите домен для TLS маскировки (Enter для значения по умолчанию www.microsoft.com): " tls_domain
                 if [ -z "$tls_domain" ]; then
                     tls_domain="www.microsoft.com"
                 fi
                 prompt_wildcard_sni
                 
-                # Получение всех пользовательских конфигураций Snell
+                # Получение конфигураций всех пользователей Snell
                 local user_configs=$(get_all_snell_users)
                 if [ -z "$user_configs" ]; then
                     echo -e "${RED}Действующие конфигурации пользователей Snell не найдены${RESET}"
                     return 1
                 fi
                 
-                # Отображение портов Snell без настроенного ShadowTLS
-                echo -e "\n${YELLOW}Список портов Snell без ShadowTLS:${RESET}"
+                # Вывод списка ненастроенных портов Snell
+                echo -e "\n${YELLOW}Список портов Snell без конфигурации ShadowTLS:${RESET}"
                 local port_list=()
                 local port_count=0
                 while IFS='|' read -r port psk; do
@@ -1449,25 +1555,25 @@ add_shadowtls_config() {
                 done <<< "$user_configs"
                 
                 if [ ${#port_list[@]} -eq 0 ]; then
-                    echo -e "${YELLOW}Все порты Snell уже настроены с ShadowTLS${RESET}"
+                    echo -e "${YELLOW}Для всех портов Snell уже настроен ShadowTLS${RESET}"
                     return 0
                 fi
                 
-                # Выбор порта
-                echo -e "\n${YELLOW}Пожалуйста, выберите порт для настройки:${RESET}"
+                # Выбор портов для настройки
+                echo -e "\n${YELLOW}Выберите порт для настройки:${RESET}"
                 echo -e "1-${#port_list[@]}. Выбрать конкретный порт"
-                echo -e "0. Настроить ShadowTLS для всех не настроенных портов"
+                echo -e "0. Настроить ShadowTLS для всех оставшихся портов"
                 
                 read -rp "Ваш выбор: " port_choice
                 
                 if [ "$port_choice" = "0" ]; then
-                    # Настройка для всех выбранных портов
+                    # Настройка ShadowTLS для всех ненастроенных портов
                     for port in "${port_list[@]}"; do
                         echo -e "\n${YELLOW}Настройка ShadowTLS для порта Snell ${port}${RESET}"
                         while true; do
-                            read -rp "Введите порт прослушивания ShadowTLS (1-65535, нажмите Enter для случайного выбора): " stls_port
+                            read -rp "Введите порт прослушивания ShadowTLS (1-65535, Enter для генерации случайного): " stls_port
                             
-                            # Проверка и получение свободного порта
+                            # Проверка и получение доступного порта
                             stls_port=$(get_available_port "$stls_port")
                             if [ $? -eq 0 ]; then
                                 break
@@ -1477,25 +1583,25 @@ add_shadowtls_config() {
                         
                         restrict_snell_to_loopback "$port" || return 1
 
-                        # Создание файла службы
+                        # Создание unit-файла сервиса
                         create_shadowtls_service "snell" "$port" "$stls_port" "$tls_domain" "$password"
                         open_port "$stls_port"
                         systemctl start "shadowtls-snell-${port}"
                         systemctl enable "shadowtls-snell-${port}"
                         
-                        # Отображение информации
+                        # Вывод конфигурации
                         local server_ip=$(get_server_ip)
                         local psk=$(get_snell_config "$port")
                         generate_snell_links "${server_ip}" "${stls_port}" "${psk}" "${password}" "${tls_domain}" "${port}"
                     done
                 elif [[ "$port_choice" =~ ^[0-9]+$ ]] && [ "$port_choice" -ge 1 ] && [ "$port_choice" -le ${#port_list[@]} ]; then
-                    # Настройка для конкретного порта
+                    # Настройка ShadowTLS для выбранного порта
                     local selected_port="${port_list[$((port_choice-1))]}"
                     echo -e "\n${YELLOW}Настройка ShadowTLS для порта Snell ${selected_port}${RESET}"
                     while true; do
-                        read -rp "Введите порт прослушивания ShadowTLS (1-65535, нажмите Enter для случайного выбора): " stls_port
+                        read -rp "Введите порт прослушивания ShadowTLS (1-65535, Enter для генерации случайного): " stls_port
                         
-                        # Проверка и получение свободного порта
+                        # Проверка и получение доступного порта
                         stls_port=$(get_available_port "$stls_port")
                         if [ $? -eq 0 ]; then
                             break
@@ -1505,13 +1611,13 @@ add_shadowtls_config() {
                     
                     restrict_snell_to_loopback "$selected_port" || return 1
 
-                    # Создание файла службы
+                    # Создание unit-файла сервиса
                     create_shadowtls_service "snell" "$selected_port" "$stls_port" "$tls_domain" "$password"
                     open_port "$stls_port"
                     systemctl start "shadowtls-snell-${selected_port}"
                     systemctl enable "shadowtls-snell-${selected_port}"
                     
-                    # Отображение информации
+                    # Вывод конфигурации
                     local server_ip=$(get_server_ip)
                     local psk=$(get_snell_config "$selected_port")
                     generate_snell_links "${server_ip}" "${stls_port}" "${psk}" "${password}" "${tls_domain}" "${selected_port}"
@@ -1546,11 +1652,11 @@ restart_shadowtls_services() {
         if [ $? -eq 0 ]; then
             echo -e "${GREEN}Служба ShadowTLS для Shadowsocks успешно перезапущена${RESET}"
         else
-            echo -e "${RED}Не удалось перезапустить службу ShadowTLS для Shadowsocks${RESET}"
+            echo -e "${RED}Ошибка перезапуска службы ShadowTLS для Shadowsocks${RESET}"
         fi
     fi
     
-    # Перезапуск служб Snell
+    # Перезапуск всех служб Snell
     local snell_services=$(find /etc/systemd/system -name "shadowtls-snell-*.service" 2>/dev/null)
     if [ ! -z "$snell_services" ]; then
         has_services=true
@@ -1562,7 +1668,7 @@ restart_shadowtls_services() {
             if [ $? -eq 0 ]; then
                 echo -e "${GREEN}Служба для порта ${port} успешно перезапущена${RESET}"
             else
-                echo -e "${RED}Не удалось перезапустить службу для порта ${port}${RESET}"
+                echo -e "${RED}Ошибка перезапуска службы для порта ${port}${RESET}"
             fi
         done <<< "$snell_services"
     fi
@@ -1572,9 +1678,9 @@ restart_shadowtls_services() {
         return 1
     fi
     
-    echo -e "\n${GREEN}Перезапуск всех служб завершен${RESET}"
+    echo -e "\n${GREEN}Все службы перезапущены${RESET}"
     
-    # Отображение статусов
+    # Вывод статуса служб
     echo -e "\n${YELLOW}Статус служб:${RESET}"
     if [ -f "${SYSTEMD_DIR}/shadowtls-ss.service" ]; then
         echo -e "\n${CYAN}Статус службы ShadowTLS для Shadowsocks:${RESET}"
@@ -1597,14 +1703,14 @@ main_menu() {
         echo -e "${YELLOW}1. Установить ShadowTLS${RESET}"
         echo -e "${YELLOW}2. Удалить ShadowTLS${RESET}"
         echo -e "${YELLOW}3. Просмотреть конфигурацию${RESET}"
-        echo -e "${YELLOW}4. Добавить новую конфигурацию${RESET}"
+        echo -e "${YELLOW}4. Добавить конфигурацию${RESET}"
         echo -e "${YELLOW}5. Перезапустить службы${RESET}"
-        echo -e "${YELLOW}6. Вернуться в предыдущее меню${RESET}"
+        echo -e "${YELLOW}6. Назад в предыдущее меню${RESET}"
         echo -e "${YELLOW}0. Выход${RESET}"
         
-        if ! read -rp "Выберите операцию [0-6]: " choice; then
+        if ! read -rp "Выберите действие [0-6]: " choice; then
             echo
-            echo -e "${YELLOW}Ввод не распознан, выход из меню ShadowTLS.${RESET}"
+            echo -e "${YELLOW}Ввод не получен, выход из меню ShadowTLS.${RESET}"
             return 0
         fi
         
@@ -1637,10 +1743,10 @@ main_menu() {
     done
 }
 
-# Проверка на права root
+# Проверка прав суперпользователя
 check_root
 
-# Вывод главного меню, если скрипт запущен напрямую
+# Запуск меню, если скрипт запущен напрямую
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     main_menu
 fi
