@@ -3091,7 +3091,7 @@ setup_bbr() {
 # Настройка ShadowTLS
 setup_shadowtls() {
     echo -e "${CYAN}Запуск скрипта управления ShadowTLS...${RESET}"
-    bash <(curl -sL https://raw.githubusercontent.com/jinqians/snell.sh/main/shadowtls.sh)
+    bash <(curl -sL https://github.com/ZSVPD/snell-script/blob/main/shadowtls.sh)
     echo -e "${GREEN}Операция настройки ShadowTLS завершена${RESET}"
     sleep 1
 }
